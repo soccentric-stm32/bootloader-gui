@@ -1,0 +1,212 @@
+"""Sequential QProcess queue: clone, build, sign and flash jobs run in order."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
+
+
+def _windows_bash_candidates() -> list[Path]:
+    env = os.environ
+    roots = [env.get("ProgramFiles"), env.get("ProgramFiles(x86)"),
+             env.get("LocalAppData") and f"{env['LocalAppData']}/Programs",
+             env.get("UserProfile") and f"{env['UserProfile']}/scoop/apps"]
+    found = [Path(root) / "Git" / "bin" / "bash.exe"
+             for root in roots[:3] if root]
+    if roots[3]:
+        found.append(Path(roots[3]) / "git" / "current" / "bin" / "bash.exe")
+    found += [Path("C:/msys64/usr/bin/bash.exe"),
+              Path("C:/tools/msys64/usr/bin/bash.exe"),
+              Path("C:/cygwin64/bin/bash.exe")]
+    return found
+
+
+def posix_bash() -> str | None:
+    """The POSIX bash the jobs run under, or None to use PATH's `bash`.
+
+    On Windows a bare `bash` usually resolves to C:\\Windows\\System32\\bash.exe,
+    the WSL launcher: it runs the command inside a Linux distribution that has
+    none of the host tools and cannot read C:\\ paths.  Use Git for Windows'
+    (or MSYS2's, Cygwin's) bash, the one make.cmd uses, as the build does.
+    """
+    if sys.platform != "win32":
+        return None
+    explicit = os.environ.get("BASH_EXE")
+    if explicit and Path(explicit).is_file():
+        return explicit
+    for candidate in _windows_bash_candidates():
+        if candidate.is_file():
+            return str(candidate)
+    # Last resort: whatever is on PATH, unless it is the WSL launcher.
+    on_path = shutil.which("bash")
+    if on_path and "system32" not in on_path.lower().replace("/", "\\"):
+        return on_path
+    return None
+
+
+def _posix_path_dirs(bash: str) -> list[str]:
+    """Directories to put first on PATH so make, sed, awk, find are POSIX."""
+    root = Path(bash).parent
+    dirs = [root, root.parent / "usr" / "bin"]
+    return [str(d) for d in dirs if d.is_dir()]
+
+
+@dataclass
+class Job:
+    step: str
+    program: str
+    args: list[str]
+    text: str
+    cwd: Path | None = None
+    display: str | None = None
+    env: dict[str, str] | None = None   # added to the inherited environment
+    # The job owns the board's serial port (bootctl); the debug monitor
+    # releases it before this job starts.
+    serial: bool = False
+    # Computes args when the job starts, from results of earlier jobs.
+    resolve: Callable[[], list[str]] | None = None
+    # Keep the output out of the console and hand it to done() on success.
+    capture: bool = False
+    done: Callable[[str], None] | None = None
+
+
+class Runner(QObject):
+    """Run jobs one after another and keep the UI informed."""
+
+    output = Signal(str)
+    started = Signal(str, str)          # step, human text
+    finished = Signal(str, bool, int)   # step, success, exit code
+    allFinished = Signal(bool)          # any failure?
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.jobs: list[Job] = []
+        self.current: Job | None = None
+        self.failed = False
+        self._buffer = ""
+        self._captured: list[str] = []
+
+        self.process = QProcess(self)
+        self.process.setProcessChannelMode(QProcess.MergedChannels)
+        self.process.readyReadStandardOutput.connect(self._drain)
+        self.process.finished.connect(self._on_finished)
+        self.process.errorOccurred.connect(self._on_error)
+
+    def busy(self) -> bool:
+        return self.process.state() != QProcess.NotRunning
+
+    def start(self, jobs: list[Job]) -> None:
+        if self.busy():
+            return
+        self.jobs = list(jobs)
+        self.failed = False
+        self._start_next()
+
+    def cancel(self) -> None:
+        self.jobs.clear()
+        if self.busy():
+            self.process.kill()
+
+    def _start_next(self) -> None:
+        if self.busy() or not self.jobs:
+            if not self.jobs and not self.failed:
+                self.allFinished.emit(False)
+            return
+        job = self.jobs.pop(0)
+        self.current = job
+        self._captured = []
+        if job.resolve is not None:
+            try:
+                job.args = job.resolve()
+            except Exception as error:  # noqa: BLE001 - report, don't crash
+                self.output.emit(f"error: {error}")
+                self.current = None
+                self.failed = True
+                self.jobs.clear()
+                self.finished.emit(job.step, False, -1)
+                self.allFinished.emit(True)
+                return
+        self.process.setWorkingDirectory(
+            str(job.cwd) if job.cwd is not None else str(Path.cwd()))
+        env = QProcessEnvironment.systemEnvironment()
+        program = job.program
+        if program == "bash":
+            bash = posix_bash()
+            if bash is not None:
+                program = bash
+                # Keep a login shell in the job's directory.
+                env.insert("CHERE_INVOKING", "1")
+                extra = os.pathsep.join(_posix_path_dirs(bash))
+                if extra:
+                    env.insert("PATH", extra + os.pathsep +
+                               env.value("PATH", ""))
+        for key, value in (job.env or {}).items():
+            env.insert(key, value)
+        self.process.setProcessEnvironment(env)
+        self.output.emit("$ " + (job.display or
+                                 " ".join([job.program, *job.args])))
+        self.started.emit(job.step, job.text)
+        self.process.start(program, job.args)
+
+    def _drain(self) -> None:
+        text = bytes(self.process.readAllStandardOutput()).decode(
+            "utf-8", "replace")
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._line(line.rstrip("\r"))
+
+    def _flush(self) -> None:
+        if self._buffer:
+            self._line(self._buffer.rstrip("\r\n"))
+            self._buffer = ""
+
+    def _line(self, line: str) -> None:
+        if self.current is not None and self.current.capture:
+            self._captured.append(line)
+        else:
+            self.output.emit(line)
+
+    def _on_finished(self, code: int, status: QProcess.ExitStatus) -> None:
+        self._drain()
+        self._flush()
+        job = self.current
+        self.current = None
+        success = status == QProcess.NormalExit and code == 0
+        if job is not None and job.capture and not success:
+            for line in self._captured:
+                self.output.emit(line)
+        if job is not None and success and job.done is not None:
+            try:
+                job.done("\n".join(self._captured))
+            except Exception as error:  # noqa: BLE001 - report, don't crash
+                self.output.emit(f"error: {error}")
+                success = False
+        if job is not None:
+            self.finished.emit(job.step, success, code)
+        if not success:
+            self.failed = True
+            self.jobs.clear()
+            self.allFinished.emit(True)
+            return
+        if self.jobs:
+            self._start_next()
+        else:
+            self.allFinished.emit(False)
+
+    def _on_error(self, error: QProcess.ProcessError) -> None:
+        if error != QProcess.FailedToStart:
+            return
+        job = self.current
+        self.current = None
+        self.failed = True
+        self.jobs.clear()
+        if job is not None:
+            self.finished.emit(job.step, False, -1)
+        self.allFinished.emit(True)

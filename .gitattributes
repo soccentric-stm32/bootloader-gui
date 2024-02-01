@@ -1,0 +1,18 @@
+# ============================================================
+# .gitattributes - checkout rules shared by Linux, macOS and Windows
+#
+# BOOT Flasher signs firmware images with mkimage.py and compares
+# digests, so the bytes of every text file (scripts, sources, specs)
+# must be the same whichever OS did the checkout: store LF in the
+# repository and check out LF everywhere.
+# ============================================================
+
+* text=auto eol=lf
+
+# --- Binary: never normalised, never diffed as text ----------
+*.png binary
+*.ico binary
+*.icns binary
+*.bin binary
+*.elf binary
+*.img binary

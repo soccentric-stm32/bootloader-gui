@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BOOT Flasher
+GenericName=STM32 Bootloader Flasher
+Comment=Flash the A/B bootloader and the firmware projects of the NUCLEO-F767ZI
+Exec="BOOT Flasher"
+Icon=boot-flasher
+Terminal=false
+Categories=Development;Electronics;
+Keywords=STM32;bootloader;flash;SWD;UART;

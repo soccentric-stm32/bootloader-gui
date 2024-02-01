@@ -1,0 +1,131 @@
+"""Device model helpers for the flash GUI (P3-6).
+
+The GUI no longer guesses the target slot or scans /dev/tty* itself: BOOT's
+`bootctl --json` output is normalised here and port discovery is shared with
+the command-line tool.
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass, field
+
+from . import projects
+
+
+@dataclass
+class SlotView:
+    slot: str = "?"
+    present: bool = False
+    valid: bool = False
+    pending: bool = False
+    confirmed: bool = False
+    rejected: bool = False
+    sequence: int = 0
+    trial_count: int = 0
+    version: str = ""
+    detail: str = ""
+
+
+@dataclass
+class BootInfoView:
+    active_slot: str | None = None
+    active_valid: bool = False
+    target_slot: str | None = None
+    flash_mode: str = ""
+    boot_version: str = ""
+    boot_build: str = ""
+    last_outcome: str = ""
+    signed_images: bool = False
+    key_id: str = ""
+    security_floor: int | None = None
+    slots: list[SlotView] = field(default_factory=list)
+
+    @property
+    def target(self) -> str | None:
+        return self.target_slot
+
+
+def _slot(value) -> str | None:
+    text = str(value or "").upper()
+    return text if text in ("A", "B") else None
+
+
+def parse_boot_info(data: dict | None) -> BootInfoView | None:
+    if data is None:
+        return None
+    view = BootInfoView(
+        active_slot=_slot(data.get("active_slot")),
+        active_valid=bool(data.get("active_valid", False)),
+        target_slot=_slot(data.get("target_slot")),
+        flash_mode=str(data.get("flash_mode", "")),
+        boot_version=str(data.get("boot_version", "")),
+        boot_build=str(data.get("boot_build", "")),
+        last_outcome=str(data.get("last_outcome", "")),
+        signed_images=bool(data.get("signed_images", False)),
+        key_id=str(data.get("key_id", "")).lower(),
+        security_floor=(int(data["security_floor"])
+                        if data.get("security_floor") is not None else None),
+    )
+    for item in data.get("slots", []):
+        view.slots.append(SlotView(
+            slot=_slot(item.get("slot")) or "?",
+            present=bool(item.get("present")),
+            valid=bool(item.get("valid")),
+            pending=bool(item.get("pending")),
+            confirmed=bool(item.get("confirmed")),
+            rejected=bool(item.get("rejected")),
+            sequence=int(item.get("sequence", 0)),
+            trial_count=int(item.get("trial_count", 0)),
+            version=str(item.get("version", "")),
+            detail=str(item.get("detail", "")),
+        ))
+    return view
+
+
+def serial_port_items() -> list[tuple[str, str]]:
+    """Every serial port as (device, description), debug candidates first.
+
+    BOOT and the applications print debug lines on USART6 (PG14, Arduino D1),
+    normally through a USB-serial adapter such as /dev/ttyUSB0.  The ST-LINK
+    VCP (/dev/ttyACM0) carries HWLINK.  Both are listed so either wiring
+    works; USB-serial adapters come first because that is the debug port in
+    the reference setup.
+    """
+    try:
+        from serial.tools import list_ports
+        items = [(port.device, port.description or port.device)
+                 for port in list_ports.comports()]
+    except Exception:  # noqa: BLE001 - pyserial may be missing
+        import glob
+        items = [(path, path) for path in
+                 sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))]
+    unique: dict[str, str] = {}
+    for device, description in items:
+        unique.setdefault(device, description)
+    # Hide the machine's built-in /dev/ttyS* ports; keep USB adapters and
+    # named ports on other platforms.  If nothing is left, show everything.
+    candidates = list(unique.items())
+    useful = [item for item in candidates
+              if item[0].startswith(("/dev/ttyUSB", "/dev/ttyACM"))
+              or item[0].upper().startswith("COM")
+              or item[1] not in ("", "n/a", "N/A")]
+
+    def rank(device: str) -> int:
+        return 0 if device.startswith("/dev/ttyUSB") else \
+               1 if device.startswith("/dev/ttyACM") else 0
+
+    return sorted(useful or candidates,
+                  key=lambda item: (rank(item[0]), item[0]))
+
+
+def stlink_ports() -> list[str]:
+    """ST-LINK VCP ports (VID 0x0483), shared with bootctl.py."""
+    try:
+        if str(projects.BOOT_TOOLS) not in sys.path:
+            sys.path.insert(0, str(projects.BOOT_TOOLS))
+        from bootctl import list_stlink_ports
+        return list_stlink_ports()
+    except Exception:  # noqa: BLE001 - pyserial may be missing
+        import glob
+        return sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
